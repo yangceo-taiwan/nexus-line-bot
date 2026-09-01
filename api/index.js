@@ -1,6 +1,8 @@
 const express = require('express');
 const line = require('@line/bot-sdk');
 const { createClient } = require('@supabase/supabase-js');
+const { waitUntil } = require('@vercel/functions');
+const crypto = require('crypto');
 
 const app = express();
 
@@ -10,33 +12,75 @@ const config = {
 };
 
 const client = new line.Client(config);
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-
-app.get('/api', (req, res) => {
-  res.status(200).send('LINE Bot is running.');
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY, {
+  auth: { persistSession: false }
 });
 
-app.post('/api', line.middleware(config), async (req, res) => {
+const QUERY_TIMEOUT_MS = Number(process.env.QUERY_TIMEOUT_MS || 8000);
+const QUERY_CACHE_TTL_MS = Number(process.env.QUERY_CACHE_TTL_MS || 5 * 60 * 1000);
+const DICTIONARY_CACHE_TTL_MS = Number(process.env.DICTIONARY_CACHE_TTL_MS || 30 * 60 * 1000);
+const MAX_CACHE_ENTRIES = 100;
+const queryCache = new Map();
+
+app.get('/api', async (req, res) => {
+  if (req.query.deep !== '1') {
+    return res.status(200).send('LINE Bot is running.');
+  }
+
+  const startedAt = Date.now();
+
   try {
-    const events = req.body.events || [];
-    await Promise.all(events.map(handleEvent));
-    res.status(200).send('OK');
-  } catch (err) {
-    console.error('Webhook error:', err);
-    res.status(200).send('OK');
+    const { error } = await supabase
+      .from('real_estate_transactions')
+      .select('id')
+      .limit(1)
+      .abortSignal(AbortSignal.timeout(QUERY_TIMEOUT_MS));
+
+    if (error) throw error;
+
+    return res.status(200).json({
+      status: 'ok',
+      database: 'ok',
+      elapsedMs: Date.now() - startedAt,
+      region: process.env.VERCEL_REGION || 'local'
+    });
+  } catch (error) {
+    console.error('Deep health check failed:', formatError(error));
+    return res.status(503).json({
+      status: 'degraded',
+      database: 'unavailable',
+      elapsedMs: Date.now() - startedAt,
+      region: process.env.VERCEL_REGION || 'local'
+    });
   }
 });
 
-app.post('/', line.middleware(config), async (req, res) => {
-  try {
+function registerWebhook(path, label) {
+  app.post(path, line.middleware(config), (req, res) => {
     const events = req.body.events || [];
-    await Promise.all(events.map(handleEvent));
-    res.status(200).send('OK');
-  } catch (err) {
-    console.error('Webhook root error:', err);
-    res.status(200).send('OK');
-  }
-});
+    const work = Promise.allSettled(events.map(handleEvent)).then(results => {
+      results.forEach((result, index) => {
+        if (result.status === 'rejected') {
+          console.error(`${label} event ${index} failed:`, formatError(result.reason));
+        }
+      });
+    });
+
+    try {
+      waitUntil(work);
+    } catch (error) {
+      console.error(`${label} waitUntil registration failed:`, formatError(error));
+      work.catch(workError => {
+        console.error(`${label} fallback work failed:`, formatError(workError));
+      });
+    }
+
+    return res.status(200).send('OK');
+  });
+}
+
+registerWebhook('/api', 'Webhook');
+registerWebhook('/', 'Webhook root');
 
 function toFullWidth(str) {
   return String(str || '').replace(/[0-9]/g, c => String.fromCharCode(c.charCodeAt(0) + 0xFEE0));
@@ -54,6 +98,62 @@ function safeKeywordForOr(keyword) {
     .replace(/[,%()]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function formatError(error) {
+  if (!error) return { message: 'Unknown error' };
+
+  return {
+    name: error.name,
+    code: error.code,
+    message: error.message,
+    details: error.details,
+    hint: error.hint,
+    status: error.status
+  };
+}
+
+function keywordFingerprint(keyword) {
+  return crypto
+    .createHash('sha256')
+    .update(String(keyword || ''))
+    .digest('hex')
+    .slice(0, 12);
+}
+
+function getCached(cacheKey) {
+  const entry = queryCache.get(cacheKey);
+
+  if (!entry) return null;
+
+  if (entry.expiresAt <= Date.now()) {
+    queryCache.delete(cacheKey);
+    return null;
+  }
+
+  return entry.promise;
+}
+
+function setCached(cacheKey, promise, ttlMs) {
+  if (queryCache.size >= MAX_CACHE_ENTRIES) {
+    const oldestKey = queryCache.keys().next().value;
+    if (oldestKey) queryCache.delete(oldestKey);
+  }
+
+  queryCache.set(cacheKey, {
+    promise,
+    expiresAt: Date.now() + ttlMs
+  });
+
+  promise.catch(() => queryCache.delete(cacheKey));
+  return promise;
+}
+
+function withCache(cacheKey, loader, ttlMs = QUERY_CACHE_TTL_MS) {
+  const cached = getCached(cacheKey);
+  if (cached) return cached;
+
+  return setCached(cacheKey, Promise.resolve().then(loader), ttlMs);
 }
 
 function toNumber(value) {
@@ -144,13 +244,20 @@ function buildKeywordVariants(keyword) {
 
   if (withoutCity) variants.add(withoutCity);
 
-  if (clean && !clean.startsWith('台南市')) variants.add(`台南市${clean}`);
-  if (clean && !clean.startsWith('臺南市')) variants.add(`臺南市${clean}`);
-
   variants.add(toFullWidth(clean));
   variants.add(toFullWidth(withoutCity));
 
   return Array.from(variants).filter(Boolean);
+}
+
+function buildIlikeOrFilter(keyword, columns) {
+  const variants = buildKeywordVariants(keyword)
+    .map(safeKeywordForOr)
+    .filter(Boolean);
+
+  return variants
+    .flatMap(variant => columns.map(column => `${column}.ilike.%${variant}%`))
+    .join(',');
 }
 
 async function resolveDictionaryKeyword(keyword) {
@@ -158,21 +265,28 @@ async function resolveDictionaryKeyword(keyword) {
 
   if (!cleanKeyword) return '';
 
-  try {
-    const { data } = await supabase
-      .from('community_dictionary')
-      .select('address_keyword')
-      .ilike('community_name', `%${cleanKeyword}%`)
-      .limit(1);
+  const cacheKey = `dictionary:${cleanKeyword}`;
 
-    if (data && data.length > 0 && data[0].address_keyword) {
-      return normalizeKeyword(data[0].address_keyword);
+  return withCache(cacheKey, async () => {
+    try {
+      const { data, error } = await supabase
+        .from('community_dictionary')
+        .select('address_keyword')
+        .ilike('community_name', `%${safeKeywordForOr(cleanKeyword)}%`)
+        .limit(1)
+        .abortSignal(AbortSignal.timeout(QUERY_TIMEOUT_MS));
+
+      if (error) throw error;
+
+      if (data && data.length > 0 && data[0].address_keyword) {
+        return normalizeKeyword(data[0].address_keyword);
+      }
+    } catch (error) {
+      console.warn('Dictionary lookup skipped:', formatError(error));
     }
-  } catch (error) {
-    console.warn('Dictionary lookup skipped:', error.message);
-  }
 
-  return cleanKeyword;
+    return cleanKeyword;
+  }, DICTIONARY_CACHE_TTL_MS);
 }
 
 async function handleEvent(event) {
@@ -202,7 +316,7 @@ async function handleEvent(event) {
     return Promise.resolve(null);
 
   } catch (error) {
-    console.error('handleEvent error:', error);
+    console.error('handleEvent error:', formatError(error));
     return client.replyMessage(event.replyToken, {
       type: 'text',
       text: '系統查詢暫時忙碌，請稍後再試一次。'
@@ -211,81 +325,100 @@ async function handleEvent(event) {
 }
 
 async function searchRealEstateRows(keyword) {
-  const variants = buildKeywordVariants(keyword);
-  const allRows = [];
+  const filter = buildIlikeOrFilter(keyword, ['address', 'notes']);
+  if (!filter) return [];
 
-  for (const variant of variants) {
-    const safeKeyword = safeKeywordForOr(variant);
-    if (!safeKeyword) continue;
+  const cacheKey = `sale:${normalizeKeyword(keyword)}`;
 
+  return withCache(cacheKey, async () => {
+    const startedAt = Date.now();
     const { data, error } = await supabase
       .from('real_estate_transactions')
       .select('city,transaction_type,address,building_type,building_age,transaction_date,unit_price_sqm,unit_price_ping,notes')
-      .or(`address.ilike.%${safeKeyword}%,notes.ilike.%${safeKeyword}%`)
-      .limit(1000);
+      .or(filter)
+      .limit(1000)
+      .abortSignal(AbortSignal.timeout(QUERY_TIMEOUT_MS));
 
     if (error) {
+      console.error('Sale query failed:', {
+        keyword: keywordFingerprint(keyword),
+        elapsedMs: Date.now() - startedAt,
+        error: formatError(error)
+      });
       throw error;
     }
 
-    if (data && data.length > 0) {
-      allRows.push(...data);
-    }
-  }
+    console.info('Sale query completed:', {
+      keyword: keywordFingerprint(keyword),
+      elapsedMs: Date.now() - startedAt,
+      rows: (data || []).length
+    });
 
-  const seen = new Set();
+    const seen = new Set();
 
-  return allRows.filter(row => {
-    const key = `${row.address || ''}|${row.transaction_date || ''}|${row.unit_price_sqm || ''}|${row.building_type || ''}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
+    return (data || []).filter(row => {
+      const key = `${row.address || ''}|${row.transaction_date || ''}|${row.unit_price_sqm || ''}|${row.building_type || ''}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
   });
 }
 
 async function searchRentalRows(keyword) {
-  const variants = buildKeywordVariants(keyword);
-  const allRows = [];
+  const filter = buildIlikeOrFilter(keyword, ['address', 'notes', 'building_type', 'floor_info']);
+  if (!filter) return [];
 
-  for (const variant of variants) {
-    const safeKeyword = safeKeywordForOr(variant);
-    if (!safeKeyword) continue;
+  const cacheKey = `rent:${normalizeKeyword(keyword)}`;
 
+  return withCache(cacheKey, async () => {
+    const startedAt = Date.now();
     const { data, error } = await supabase
       .from('rental_transactions')
       .select('city,transaction_type,address,building_type,total_rent,unit_rent_ping,total_area_sqm,floor_info,notes,transaction_date')
-      .or(`address.ilike.%${safeKeyword}%,notes.ilike.%${safeKeyword}%,building_type.ilike.%${safeKeyword}%,floor_info.ilike.%${safeKeyword}%`)
-      .limit(1000);
+      .or(filter)
+      .limit(1000)
+      .abortSignal(AbortSignal.timeout(QUERY_TIMEOUT_MS));
 
     if (error) {
+      console.error('Rental query failed:', {
+        keyword: keywordFingerprint(keyword),
+        elapsedMs: Date.now() - startedAt,
+        error: formatError(error)
+      });
       throw error;
     }
 
-    if (data && data.length > 0) {
-      allRows.push(...data);
-    }
-  }
+    console.info('Rental query completed:', {
+      keyword: keywordFingerprint(keyword),
+      elapsedMs: Date.now() - startedAt,
+      rows: (data || []).length
+    });
 
-  const seen = new Set();
+    const seen = new Set();
 
-  return allRows.filter(row => {
-    const key = `${row.address || ''}|${row.transaction_date || ''}|${row.total_rent || ''}|${row.floor_info || ''}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
+    return (data || []).filter(row => {
+      const key = `${row.address || ''}|${row.transaction_date || ''}|${row.total_rent || ''}|${row.floor_info || ''}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
   });
 }
 
 async function getCitywideRentalRows() {
-  const { data, error } = await supabase
-    .from('rental_transactions')
-    .select('city,transaction_type,address,building_type,total_rent,unit_rent_ping,total_area_sqm,floor_info,notes,transaction_date')
-    .eq('city', '台南市')
-    .limit(2000);
+  return withCache('rent:citywide:tainan', async () => {
+    const { data, error } = await supabase
+      .from('rental_transactions')
+      .select('city,transaction_type,address,building_type,total_rent,unit_rent_ping,total_area_sqm,floor_info,notes,transaction_date')
+      .eq('city', '台南市')
+      .limit(2000)
+      .abortSignal(AbortSignal.timeout(QUERY_TIMEOUT_MS));
 
-  if (error) throw error;
+    if (error) throw error;
 
-  return data || [];
+    return data || [];
+  });
 }
 
 async function handleEstimate(event, rawText) {
@@ -1024,3 +1157,9 @@ async function handleRent(event, rawText) {
 }
 
 module.exports = app;
+module.exports.__test = {
+  buildKeywordVariants,
+  buildIlikeOrFilter,
+  normalizeKeyword,
+  safeKeywordForOr
+};
